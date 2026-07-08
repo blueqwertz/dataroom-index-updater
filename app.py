@@ -6,14 +6,16 @@ Dataroom Index Updater -- GUI
 Kleines Fenster um update_index.py: zwei Dateifelder (Current-Index und
 frischer Datenraum-Export), Browse-Buttons und Drag&Drop aus dem Explorer.
 Optionen (Anker-Spalte, Markierungs-Spalten, Formatierung neuer Zeilen)
-sind eingeklappt und werden in %APPDATA%\\IndexUpdater\\settings.json
-gespeichert.
+sind eingeklappt und werden pro Betriebssystem im passenden Konfig-Ordner
+(Windows: %APPDATA%, macOS: ~/Library/Application Support, Linux: XDG)
+unter IndexUpdater/settings.json gespeichert.
 
 Start:  python app.py
 """
 
 import json
 import os
+import subprocess
 import sys
 import threading
 import traceback
@@ -32,8 +34,31 @@ from update_index import run_update, shared_headers
 
 APP_NAME = "Dataroom Index Updater"
 AUTO = "Auto-detect"
-SETTINGS_DIR = Path(os.environ.get("APPDATA", Path.home())) / "IndexUpdater"
+
+
+def _settings_dir():
+    """Per-OS config location for settings.json."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA", Path.home())
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")
+    return Path(base) / "IndexUpdater"
+
+
+SETTINGS_DIR = _settings_dir()
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
+
+
+def open_file(path):
+    """Open a file with the OS default application, cross-platform."""
+    if sys.platform == "win32":
+        os.startfile(path)  # noqa: SIM115 -- Windows-only API
+    elif sys.platform == "darwin":
+        subprocess.run(["open", path], check=False)
+    else:
+        subprocess.run(["xdg-open", path], check=False)
 
 DEFAULT_SETTINGS = {
     "highlight_cols": "",
@@ -359,7 +384,7 @@ class App:
                 f"New rows: {len(result['new'])}\n"
                 f"Anchor used: {key} ({result['key_reason']})\n\n"
                 "Open the file now?"):
-            os.startfile(out)
+            open_file(out)
 
     def on_close(self):
         self.settings.update({
