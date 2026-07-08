@@ -41,6 +41,7 @@ from copy import copy
 
 import openpyxl
 from openpyxl.styles import PatternFill
+from openpyxl.utils import column_index_from_string
 
 YELLOW = PatternFill(fill_type="solid", fgColor="FFFFFF00")
 
@@ -170,22 +171,81 @@ def capture_row(ws, row):
             for c in range(1, ws.max_column + 1)}
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Dataroom-Index-Updater")
-    ap.add_argument("--input", default="dataroom-input.xlsx",
-                    help="Frischer Datenraum-Export")
-    ap.add_argument("--current", default="current-index.xlsx",
-                    help="Bestehender angereicherter Index")
-    ap.add_argument("--output", default="index-updated.xlsx",
-                    help="Zieldatei")
-    args = ap.parse_args()
+def parse_highlight_cols(spec, max_col):
+    """Parst eine Spaltenangabe wie "B-D", "B:D", "A,C-E" oder "2-4" in ein
+    Set von 1-basierten Spaltenindizes. Leer/None/"all" -> alle Spalten."""
+    if spec is None or str(spec).strip() == "" or str(spec).strip().lower() in ("all", "alle"):
+        return set(range(1, max_col + 1))
+    cols = set()
+    for part in str(spec).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sep = "-" if "-" in part else (":" if ":" in part else None)
+        if sep:
+            a, b = (p.strip() for p in part.split(sep, 1))
+            lo, hi = _col_index(a), _col_index(b)
+            if lo > hi:
+                lo, hi = hi, lo
+            cols.update(range(lo, hi + 1))
+        else:
+            cols.add(_col_index(part))
+    return {c for c in cols if 1 <= c <= max_col}
 
-    in_wb, in_ws, in_map, in_rows = read_sheet(args.input)
-    cur_wb, cur_ws, cur_map, cur_rows = read_sheet(args.current)
 
-    key_headers, key_reason = choose_key(in_map, in_ws, in_rows,
-                                          cur_map, cur_ws, cur_rows)
-    print(f"Anker gewaehlt: {key_headers}  ({key_reason})")
+def _col_index(token):
+    token = token.strip()
+    if token.isdigit():
+        return int(token)
+    return column_index_from_string(token.upper())
+
+
+def shared_headers(path_a, path_b):
+    """Gemeinsame Header beider Dateien (Original-Schreibweise aus Datei A),
+    fuer die Anker-Auswahl in der GUI."""
+    def headers(path):
+        wb = openpyxl.load_workbook(path, read_only=True)
+        ws = wb.active
+        row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        wb.close()
+        return {norm(v): str(v).strip() for v in row if not is_empty(v)}
+    a, b = headers(path_a), headers(path_b)
+    return [a[h] for h in a if h in b]
+
+
+def run_update(input_path, current_path, output_path,
+               key_override=None, highlight_cols=None,
+               fill_color="FFFF00", bold=False, underline=None,
+               font_color=None, confirm=None, log=print):
+    """Fuehrt den Index-Update aus.
+
+    key_override:   Liste von Header-Namen als Anker (None = Auto-Erkennung)
+    highlight_cols: Spaltenangabe fuer die Markierung neuer Zeilen ("B-D",
+                    "2-4", None/"all" = alle Spalten)
+    fill_color:     Hex-Farbe der Fuellung neuer Zeilen (None = keine Fuellung)
+    underline:      None | "single" | "double"
+    font_color:     Hex-Schriftfarbe neuer Zeilen (None = unveraendert)
+    confirm:        optionaler Callback(liste_von_titeln) -> bool; bei False
+                    wird abgebrochen und nichts gespeichert
+    Rueckgabe: dict mit existing, new (Liste (zeile, titel)), key, key_reason,
+    output -- oder None, wenn confirm abgelehnt hat.
+    """
+    in_wb, in_ws, in_map, in_rows = read_sheet(input_path)
+    cur_wb, cur_ws, cur_map, cur_rows = read_sheet(current_path)
+
+    if key_override:
+        key_headers = [norm(h) for h in key_override]
+        missing = [h for h in key_headers if h not in in_map or h not in cur_map]
+        if missing:
+            raise ValueError(f"Anker-Spalte(n) nicht in beiden Dateien vorhanden: {missing}")
+        key_reason = "manuell gewaehlt"
+        if not (key_is_unique(in_ws, in_map, in_rows, key_headers)
+                and key_is_unique(cur_ws, cur_map, cur_rows, key_headers)):
+            key_reason += " (WARNUNG: nicht eindeutig)"
+    else:
+        key_headers, key_reason = choose_key(in_map, in_ws, in_rows,
+                                             cur_map, cur_ws, cur_rows)
+    log(f"Anker gewaehlt: {key_headers}  ({key_reason})")
 
     # Vorhandene Schluessel im Current
     cur_keys = {row_key(cur_ws, cur_map, r, key_headers) for r in cur_rows}
@@ -239,13 +299,26 @@ def main():
             output_markers.insert(pos + 1, marker)
             last_anchor_key = k  # weitere neue Zeilen dahinter, in Reihenfolge
 
+    # Vorschau der neuen Zeilen -> optionale Bestaetigung vor dem Schreiben
+    pending_new = [item.get("_title") for item in output_markers
+                   if item["type"] == "new"]
+    if confirm is not None and not confirm(pending_new):
+        log("Abgebrochen -- nichts gespeichert.")
+        return None
+
     # Zielarbeitsmappe = Kopie des Current (behaelt Spaltenbreiten, Blattname etc.)
-    out_wb = openpyxl.load_workbook(args.current)
+    out_wb = openpyxl.load_workbook(current_path)
     out_ws = out_wb.active
 
     # Datenbereich leeren (ab Zeile 2)
     if out_ws.max_row >= 2:
         out_ws.delete_rows(2, out_ws.max_row - 1)
+
+    mark_cols = parse_highlight_cols(highlight_cols, out_ws.max_column)
+    fill = None
+    if fill_color:
+        rgb = fill_color.replace("#", "").upper()[-6:]
+        fill = PatternFill(fill_type="solid", fgColor="FF" + rgb)
 
     # Zeilen neu schreiben; Zeilennummer neuer Zeilen (in der Zieldatei) merken
     new_rows = []  # (zeilennummer_in_ausgabe, title)
@@ -259,16 +332,42 @@ def main():
             cell = out_ws.cell(row_idx, c)
             cell.value = value
             cell._style = copy(style)
-            if is_new:
-                cell.fill = YELLOW
+            if is_new and c in mark_cols:
+                if fill is not None:
+                    cell.fill = fill
+                if bold or underline or font_color:
+                    f = copy(cell.font)
+                    if bold:
+                        f.bold = True
+                    if underline:
+                        f.underline = underline
+                    if font_color:
+                        f.color = openpyxl.styles.Color(
+                            rgb="FF" + font_color.replace("#", "").upper()[-6:])
+                    cell.font = f
 
-    out_wb.save(args.output)
+    out_wb.save(output_path)
 
-    print(f"\nBestehende Zeilen: {len(cur_rows)}")
-    print(f"Neue Zeilen hinzugefuegt: {len(new_rows)}")
+    log(f"\nBestehende Zeilen: {len(cur_rows)}")
+    log(f"Neue Zeilen hinzugefuegt: {len(new_rows)}")
     for row_idx, title in new_rows:
-        print(f"  + Zeile {row_idx}: {title}")
-    print(f"\nGespeichert: {args.output}")
+        log(f"  + Zeile {row_idx}: {title}")
+    log(f"\nGespeichert: {output_path}")
+    return {"existing": len(cur_rows), "new": new_rows,
+            "key": key_headers, "key_reason": key_reason,
+            "output": output_path}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Dataroom-Index-Updater")
+    ap.add_argument("--input", default="dataroom-input.xlsx",
+                    help="Frischer Datenraum-Export")
+    ap.add_argument("--current", default="current-index.xlsx",
+                    help="Bestehender angereicherter Index")
+    ap.add_argument("--output", default="index-updated.xlsx",
+                    help="Zieldatei")
+    args = ap.parse_args()
+    run_update(args.input, args.current, args.output)
 
 
 if __name__ == "__main__":
